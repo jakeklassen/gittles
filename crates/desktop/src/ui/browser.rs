@@ -10,14 +10,15 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use gittles_core::{Config, GitHub, Star, Store, auth, search};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, img,
-    px, rgb, uniform_list,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Image,
+    ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    Window, div, img, px, rgb, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use jiff::Timestamp;
@@ -139,6 +140,8 @@ pub struct Browser {
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
     sign_in: Option<DevicePrompt>,
+    /// Briefly true after the device code is copied, for the button's feedback.
+    copied: bool,
 }
 
 impl Browser {
@@ -185,6 +188,7 @@ impl Browser {
             scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             sign_in: None,
+            copied: false,
         }
     }
 
@@ -278,6 +282,7 @@ impl Browser {
 
         self.mode = Mode::SignIn;
         self.sign_in = None;
+        self.copied = false;
         self.status = Some((Tone::Info, "contacting GitHub…".into()));
         cx.notify();
 
@@ -304,6 +309,28 @@ impl Browser {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Put the device code on the clipboard. Typing it by hand is the one bit of
+    /// friction GitHub's device flow forces on us; this removes it.
+    fn copy_code(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.sign_in.as_ref() else {
+            return;
+        };
+
+        cx.write_to_clipboard(ClipboardItem::new_string(prompt.user_code.clone()));
+        self.copied = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| {
+                this.copied = false;
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -496,6 +523,9 @@ impl Browser {
             // Escape abandons the wait. Dropping the receiver stops the worker.
             Mode::SignIn => {
                 cx.stop_propagation();
+                if key == "c" {
+                    self.copy_code(cx);
+                }
                 if key == "escape" {
                     self.sign_in = None;
                     self.mode = Mode::List;
@@ -561,6 +591,39 @@ impl Browser {
 }
 
 // ---------------------------------------------------------------- rendering
+
+/// Two overlapping sheets, drawn rather than typed: a glyph like ⧉ falls back
+/// to tofu on some Windows font stacks, and this has to read as "copy" there.
+fn copy_glyph(color: u32) -> impl IntoElement {
+    div()
+        .relative()
+        .w(px(13.))
+        .h(px(13.))
+        .child(
+            div()
+                .absolute()
+                .top(px(0.))
+                .right(px(0.))
+                .w(px(9.))
+                .h(px(9.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .child(
+            // Opaque so it occludes the sheet behind it.
+            div()
+                .absolute()
+                .bottom(px(0.))
+                .left(px(0.))
+                .w(px(9.))
+                .h(px(9.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(rgb(color))
+                .bg(rgb(BG)),
+        )
+}
 
 fn dim_text(text: impl Into<SharedString>) -> impl IntoElement {
     div().text_color(rgb(DIM)).child(text.into())
@@ -839,7 +902,7 @@ impl Browser {
             .child(div().text_color(rgb(FAINT)).text_size(px(12.)).child(hints))
     }
 
-    fn sign_in_view(&self) -> impl IntoElement {
+    fn sign_in_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_1()
             .flex()
@@ -868,13 +931,47 @@ impl Browser {
                     .child(div().pt(px(8.)).child(dim_text("2. enter this code")))
                     .child(
                         div()
-                            .text_size(px(34.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(YELLOW))
-                            .child(prompt.user_code.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(16.))
+                            .child(
+                                div()
+                                    .text_size(px(34.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(YELLOW))
+                                    .child(prompt.user_code.clone()),
+                            )
+                            .child(self.copy_button(cx)),
                     )
             }))
-            .child(div().pt(px(10.)).child(dim_text("esc to cancel")))
+            .child(
+                div()
+                    .pt(px(10.))
+                    .child(dim_text("c to copy · esc to cancel")),
+            )
+    }
+
+    fn copy_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let copied = self.copied;
+        let tint = if copied { GREEN } else { DIM };
+
+        div()
+            .id("copy-code")
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .px(px(11.))
+            .py(px(7.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(rgb(if copied { GREEN } else { FAINT }))
+            .text_color(rgb(tint))
+            .text_size(px(12.))
+            .cursor_pointer()
+            .hover(|button| button.border_color(rgb(CYAN)))
+            .on_click(cx.listener(|this, _event, _window, cx| this.copy_code(cx)))
+            .child(copy_glyph(tint))
+            .child(if copied { "copied" } else { "copy" })
     }
 
     fn help(&self) -> impl IntoElement {
@@ -926,7 +1023,7 @@ impl Render for Browser {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.mode {
             Mode::Help => self.help().into_any_element(),
-            Mode::SignIn => self.sign_in_view().into_any_element(),
+            Mode::SignIn => self.sign_in_view(cx).into_any_element(),
             _ => self.list(cx).into_any_element(),
         };
 
