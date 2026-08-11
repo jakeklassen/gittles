@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="1024" height="1024">
+  <!-- The gittles mark, geometry lifted verbatim from the CLI site's favicon:
+       a candy shell with an octocat on it. -->
+  <circle cx="16" cy="16" r="15" fill="#f43f5e"/>
+  <g fill="#7d1330">
+    <path d="M9.0 12.4 L10.8 6.9 L13.9 10.4 Z"/>
+    <path d="M23.0 12.4 L21.2 6.9 L18.1 10.4 Z"/>
+    <ellipse cx="16" cy="15.6" rx="7.1" ry="6.1"/>
+    <path d="M11.6 21.6 q1.7 3.1 4.4 3.1 q2.7 0 4.4 -3.1 q-2.2 1.3 -4.4 1.3 q-2.2 0 -4.4 -1.3 Z"/>
+  </g>
+  <circle cx="13.4" cy="14.9" r="1.25" fill="#ffe3e9"/>
+  <circle cx="18.6" cy="14.9" r="1.25" fill="#ffe3e9"/>
+</svg>

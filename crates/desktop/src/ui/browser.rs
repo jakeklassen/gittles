@@ -9,15 +9,15 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use gittles_core::{Config, GitHub, Star, Store, auth, search};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, rgb,
-    uniform_list,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, img,
+    px, rgb, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use jiff::Timestamp;
@@ -38,6 +38,17 @@ const YELLOW: u32 = 0xfacc15;
 const RED: u32 = 0xf87171;
 
 const ROW_HEIGHT: f32 = 26.0;
+
+/// The gittles mark, decoded once and shared by every frame. Handed to `img` as
+/// bytes rather than an asset path: a bare filename parses as a relative URI, so
+/// the path form is taken for a URL and silently fetched over HTTP instead of
+/// being read out of the binary.
+static LOGO: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../../assets/icon-128.png").to_vec(),
+    ))
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -574,11 +585,12 @@ impl Browser {
                     .flex()
                     .items_center()
                     .gap(px(10.))
+                    .child(img(LOGO.clone()).w(px(19.)).h(px(19.)))
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(CYAN))
-                            .child("★ GITTLES"),
+                            .child("GITTLES"),
                     )
                     .child(
                         div()
