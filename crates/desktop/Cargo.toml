@@ -1,0 +1,16 @@
+[package]
+name = "gittles-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gittles"
+path = "src/main.rs"
+
+[dependencies]
+gittles-core.workspace = true
+
+anyhow.workspace = true
+gpui.workspace = true
+tokio.workspace = true

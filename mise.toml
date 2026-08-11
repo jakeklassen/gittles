@@ -1,0 +1,7 @@
+[tools]
+rust = "1.94.0"
+
+[tasks.dev]
+run = "cargo run -p gittles-desktop"
+[tasks.test]
+run = "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
