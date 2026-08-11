@@ -1,3 +1,7 @@
+// Windows would otherwise open a console window behind the app on every launch.
+// See `windows_console` below for how the terminal commands keep their output.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod ui;
 
 use std::sync::Arc;
@@ -31,8 +35,58 @@ struct Args {
     logout: bool,
 }
 
+/// A GUI-subsystem process starts with no console at all, which is what we want
+/// when gittles is opened from Explorer or a dock. The terminal subcommands still
+/// have to be readable, though — `--sync` prints the device-flow code, and an
+/// invisible code means you cannot sign in.
+///
+/// So: attach to the terminal that launched us when there is one, and fall back
+/// to a console of our own only for the commands that actually print. Browsing
+/// never allocates one, so it never flashes a window.
+#[cfg(windows)]
+mod windows_console {
+    use core::ffi::c_void;
+
+    // kernel32 is always linked; declaring these directly avoids pulling in a
+    // whole windows-sys version of our own just for three calls.
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+        fn GetConsoleWindow() -> *mut c_void;
+    }
+
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    /// Adopt the launching terminal if there is one. Silent no-op otherwise.
+    pub fn attach() {
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+
+    /// Guarantee somewhere to print, for the commands whose output matters.
+    pub fn ensure() {
+        unsafe {
+            if !GetConsoleWindow().is_null() {
+                return;
+            }
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                AllocConsole();
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Before anything prints: Rust resolves the stdout handle on first use, so
+    // the console has to exist by then or the output goes nowhere.
+    #[cfg(windows)]
+    if args.sync || args.logout {
+        windows_console::ensure();
+    } else {
+        windows_console::attach();
+    }
+
     let store = Store::discover()?;
 
     if args.logout {

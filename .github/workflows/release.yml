@@ -1,0 +1,131 @@
+name: release
+
+# Builds gittles for each platform and attaches the binaries to a GitHub release.
+#
+# Metal and DirectX shaders cannot be cross-compiled from Linux, so unlike the CLI
+# — which built every target on one runner — each OS must build on its own runner.
+#
+# The release is created as a draft first and only published once every platform
+# has uploaded, so a single failing target can never ship a half-empty release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build and release, e.g. 0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: '1.94.0'
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  draft:
+    name: draft release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # The version in Cargo.toml is what the app shows in its footer, so a tag
+      # that disagrees with it would ship a binary that misreports itself.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          MANIFEST=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$MANIFEST" != "${{ steps.version.outputs.version }}" ]; then
+            echo "tag says ${{ steps.version.outputs.version }}, Cargo.toml says ${MANIFEST}" >&2
+            exit 1
+          fi
+
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+          fi
+
+  build:
+    name: ${{ matrix.asset }}
+    needs: draft
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: gittles-linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: gittles-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: gittles-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: .github/scripts/linux-deps.sh
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --package gittles-desktop
+
+      - name: Stage the binary and its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/gittles.exe" "dist/${{ matrix.asset }}"
+          else
+            cp "target/${{ matrix.target }}/release/gittles" "dist/${{ matrix.asset }}"
+          fi
+          cd dist
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Attach to the draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${{ needs.draft.outputs.tag }}" \
+            "dist/${{ matrix.asset }}" "dist/${{ matrix.asset }}.sha256" --clobber
+
+  publish:
+    name: publish
+    needs: [draft, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Undraft the release
+        run: gh release edit "${{ needs.draft.outputs.tag }}" --draft=false
