@@ -11,12 +11,13 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use gittles_core::{GitHub, Star, Store, search};
+use gittles_core::{Config, GitHub, Star, Store, auth, search};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, ScrollStrategy, SharedString, Styled,
-    UniformListScrollHandle, Window, div, px, rgb, uniform_list,
+    IntoElement, KeyDownEvent, ParentElement, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, rgb,
+    uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use jiff::Timestamp;
@@ -45,6 +46,8 @@ enum Mode {
     Help,
     /// A network commit is in flight; input is ignored until it lands.
     Busy,
+    /// Signing in: the device code is on screen and we are polling GitHub.
+    SignIn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,31 @@ enum Commit {
     },
 }
 
+/// Progress from the sign-in + sync worker.
+enum SignIn {
+    Code {
+        user_code: String,
+        verification_uri: String,
+    },
+    Authorized {
+        username: String,
+    },
+    Syncing {
+        fetched: usize,
+        page: u32,
+    },
+    Done {
+        stars: Vec<Star>,
+    },
+    Failed(String),
+}
+
+/// What the user has to act on: open the page, type the code.
+struct DevicePrompt {
+    user_code: String,
+    verification_uri: String,
+}
+
 pub struct Browser {
     all: Vec<Star>,
     /// Indices into `all`, in display order.
@@ -99,6 +127,7 @@ pub struct Browser {
     search_input: Entity<InputState>,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
+    sign_in: Option<DevicePrompt>,
 }
 
 impl Browser {
@@ -144,6 +173,7 @@ impl Browser {
             search_input,
             scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
+            sign_in: None,
         }
     }
 
@@ -224,6 +254,100 @@ impl Browser {
         let (url, full_name) = (star.url.clone(), star.full_name.clone());
         cx.open_url(&url);
         self.status = Some((Tone::Good, format!("opened {full_name}").into()));
+        cx.notify();
+    }
+
+    /// Sign in if there is no token, then pull the star list. The GUI equivalent
+    /// of the CLI's `ensureToken()` → `sync()` — a desktop app should never need
+    /// a terminal to get started, on any platform.
+    fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.mode, Mode::Busy | Mode::SignIn) {
+            return;
+        }
+
+        self.mode = Mode::SignIn;
+        self.sign_in = None;
+        self.status = Some((Tone::Info, "contacting GitHub…".into()));
+        cx.notify();
+
+        let store = self.store.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SignIn>();
+
+        self.runtime.spawn(async move {
+            if let Err(error) = sign_in_and_sync(&store, &tx).await {
+                let _ = tx.send(SignIn::Failed(error.to_string()));
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            while let Some(message) = rx.recv().await {
+                let finished = matches!(message, SignIn::Done { .. } | SignIn::Failed(_));
+                if this
+                    .update(cx, |this, cx| this.apply_sign_in(message, cx))
+                    .is_err()
+                {
+                    break;
+                }
+
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_sign_in(&mut self, message: SignIn, cx: &mut Context<Self>) {
+        match message {
+            SignIn::Code {
+                user_code,
+                verification_uri,
+            } => {
+                // Open the page for them; GitHub still requires the code typed in
+                // by hand, so it stays on screen until authorization lands.
+                cx.open_url(&verification_uri);
+                self.sign_in = Some(DevicePrompt {
+                    user_code,
+                    verification_uri,
+                });
+                self.status = Some((Tone::Info, "waiting for authorization…".into()));
+            }
+            SignIn::Authorized { username } => {
+                self.username = username;
+                self.sign_in = None;
+                self.status = Some((Tone::Good, "authorized — fetching your stars…".into()));
+            }
+            SignIn::Syncing { fetched, page } => {
+                self.status = Some((
+                    Tone::Info,
+                    format!(
+                        "fetched {} stars (page {page})…",
+                        group_digits(fetched as u64)
+                    )
+                    .into(),
+                ));
+            }
+            SignIn::Done { stars } => {
+                let count = stars.len();
+                self.all = stars;
+                self.rows = search::filter(&self.all, &self.query);
+                self.selected = 0;
+                self.last_synced_at = self.store.load_config().last_synced_at;
+                self.now = Timestamp::now();
+                self.sign_in = None;
+                self.mode = Mode::List;
+                self.status = Some((
+                    Tone::Good,
+                    format!("synced {} stars", group_digits(count as u64)).into(),
+                ));
+            }
+            SignIn::Failed(error) => {
+                self.sign_in = None;
+                self.mode = Mode::List;
+                self.status = Some((Tone::Bad, format!("sign in failed: {error}").into()));
+            }
+        }
+
         cx.notify();
     }
 
@@ -358,6 +482,17 @@ impl Browser {
             // the search field underneath.
             Mode::Busy => cx.stop_propagation(),
 
+            // Escape abandons the wait. Dropping the receiver stops the worker.
+            Mode::SignIn => {
+                cx.stop_propagation();
+                if key == "escape" {
+                    self.sign_in = None;
+                    self.mode = Mode::List;
+                    self.status = Some((Tone::Info, "sign in cancelled".into()));
+                    cx.notify();
+                }
+            }
+
             Mode::Help => {
                 self.mode = Mode::List;
                 cx.stop_propagation();
@@ -391,6 +526,7 @@ impl Browser {
                     "end" => self.select(self.rows.len().saturating_sub(1), cx),
                     "g" if shift => self.select(self.rows.len().saturating_sub(1), cx),
                     "g" => self.select(0, cx),
+                    "s" if shift => self.start_sign_in(cx),
                     "/" | "s" => self.enter_search(window, cx),
                     "x" => self.clear_search(window, cx),
                     "?" => {
@@ -558,18 +694,44 @@ impl Browser {
 
     fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.rows.is_empty() {
-            let message = if self.all.is_empty() {
-                "no stars stored yet — run `gittles --sync`"
-            } else {
-                "nothing matches that search"
-            };
+            // Nothing stored yet is not an error state, it is the first run —
+            // so it offers the action rather than naming a terminal command.
+            if self.all.is_empty() {
+                return div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(14.))
+                    .child(dim_text("no stars yet"))
+                    .child(
+                        div()
+                            .id("sign-in")
+                            .px(px(18.))
+                            .py(px(9.))
+                            .rounded(px(6.))
+                            .bg(rgb(ROW_SELECTED))
+                            .border_1()
+                            .border_color(rgb(FAINT))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|button| button.border_color(rgb(CYAN)))
+                            .on_click(
+                                cx.listener(|this, _event, _window, cx| this.start_sign_in(cx)),
+                            )
+                            .child("Sign in with GitHub"),
+                    )
+                    .child(dim_text("or press S"))
+                    .into_any_element();
+            }
 
             return div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(dim_text(message))
+                .child(dim_text("nothing matches that search"))
                 .into_any_element();
         }
 
@@ -620,7 +782,7 @@ impl Browser {
         let hints = if self.mode == Mode::Search {
             "enter/esc done · ↑↓ move"
         } else {
-            "↑↓/jk move · / search · o open · d mark · c commit · ? help · q quit"
+            "↑↓/jk move · / search · o open · d mark · c commit · S sync · ? help · q quit"
         };
 
         div()
@@ -665,6 +827,44 @@ impl Browser {
             .child(div().text_color(rgb(FAINT)).text_size(px(12.)).child(hints))
     }
 
+    fn sign_in_view(&self) -> impl IntoElement {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(18.))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Sign in with GitHub"),
+            )
+            .children(self.sign_in.as_ref().map(|prompt| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(dim_text("1. open this page — it should already be open"))
+                    .child(
+                        div()
+                            .text_color(rgb(CYAN))
+                            .child(prompt.verification_uri.clone()),
+                    )
+                    .child(div().pt(px(8.)).child(dim_text("2. enter this code")))
+                    .child(
+                        div()
+                            .text_size(px(34.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(YELLOW))
+                            .child(prompt.user_code.clone()),
+                    )
+            }))
+            .child(div().pt(px(10.)).child(dim_text("esc to cancel")))
+    }
+
     fn help(&self) -> impl IntoElement {
         let keys = [
             ("↑ ↓ j k", "move"),
@@ -677,6 +877,7 @@ impl Browser {
             ("U", "unmark everything"),
             ("c", "commit — unstar everything marked"),
             ("?", "this help"),
+            ("S", "sign in and sync your stars"),
             ("q", "quit"),
         ];
 
@@ -711,10 +912,10 @@ impl Focusable for Browser {
 
 impl Render for Browser {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = if self.mode == Mode::Help {
-            self.help().into_any_element()
-        } else {
-            self.list(cx).into_any_element()
+        let body = match self.mode {
+            Mode::Help => self.help().into_any_element(),
+            Mode::SignIn => self.sign_in_view().into_any_element(),
+            _ => self.list(cx).into_any_element(),
         };
 
         div()
@@ -734,4 +935,76 @@ impl Render for Browser {
             .child(self.detail())
             .child(self.footer())
     }
+}
+
+/// The whole sign-in + sync sequence, on the tokio runtime. Every step reports
+/// through `tx`; a closed channel means the user cancelled, so we stop quietly.
+async fn sign_in_and_sync(
+    store: &Store,
+    tx: &tokio::sync::mpsc::UnboundedSender<SignIn>,
+) -> anyhow::Result<()> {
+    let mut token = store.load_config().token;
+
+    if token.is_empty() {
+        let device = auth::request_device_code().await?;
+
+        if tx
+            .send(SignIn::Code {
+                user_code: device.user_code.clone(),
+                verification_uri: device.verification_uri.clone(),
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let mut interval = device.interval();
+        let deadline = std::time::Instant::now() + device.expires_in();
+
+        token = loop {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("the code expired — start again");
+            }
+
+            tokio::time::sleep(interval).await;
+
+            if tx.is_closed() {
+                return Ok(());
+            }
+
+            let outcome = auth::poll_once(&device.device_code).await?;
+            interval = auth::next_interval(interval, &outcome);
+
+            if let auth::Poll::Authorized(token) = outcome {
+                break token;
+            }
+        };
+    }
+
+    let github = GitHub::new(&token)?;
+    let username = github.username().await?;
+
+    let config = store.load_config();
+    store.save_config(&Config {
+        token,
+        username: username.clone(),
+        ..config
+    })?;
+
+    if tx.send(SignIn::Authorized { username }).is_err() {
+        return Ok(());
+    }
+
+    let progress = tx.clone();
+    let stars = github
+        .stars(0, move |fetched, page| {
+            let _ = progress.send(SignIn::Syncing { fetched, page });
+        })
+        .await?;
+
+    store.save_stars(&stars)?;
+    store.mark_synced(Timestamp::now().to_string())?;
+
+    let _ = tx.send(SignIn::Done { stars });
+    Ok(())
 }
