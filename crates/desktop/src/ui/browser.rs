@@ -120,6 +120,15 @@ struct DevicePrompt {
     verification_uri: String,
 }
 
+/// How far the sign-in has got. The centre of the window renders this, so it has
+/// to name every step: an authorized-but-still-syncing state that still reads
+/// "Sign in with GitHub" looks like nothing happened.
+enum SignInPhase {
+    Connecting,
+    AwaitingCode(DevicePrompt),
+    Syncing { fetched: usize, page: u32 },
+}
+
 pub struct Browser {
     all: Vec<Star>,
     /// Indices into `all`, in display order.
@@ -139,7 +148,7 @@ pub struct Browser {
     search_input: Entity<InputState>,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
-    sign_in: Option<DevicePrompt>,
+    sign_in: Option<SignInPhase>,
     /// Briefly true after the device code is copied, for the button's feedback.
     copied: bool,
 }
@@ -281,9 +290,11 @@ impl Browser {
         }
 
         self.mode = Mode::SignIn;
-        self.sign_in = None;
+        self.sign_in = Some(SignInPhase::Connecting);
         self.copied = false;
-        self.status = Some((Tone::Info, "contacting GitHub…".into()));
+        // The centre of the window carries sign-in progress from here, so the
+        // footer status is left alone rather than saying it twice.
+        self.status = None;
         cx.notify();
 
         let store = self.store.clone();
@@ -316,7 +327,7 @@ impl Browser {
     /// Put the device code on the clipboard. Typing it by hand is the one bit of
     /// friction GitHub's device flow forces on us; this removes it.
     fn copy_code(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.sign_in.as_ref() else {
+        let Some(SignInPhase::AwaitingCode(prompt)) = self.sign_in.as_ref() else {
             return;
         };
 
@@ -335,6 +346,22 @@ impl Browser {
         .detach();
     }
 
+    /// Forget the token. The cached stars stay: they are expensive to refetch and
+    /// are not secret. A full reset means deleting the config directory.
+    fn sign_out(&mut self, cx: &mut Context<Self>) {
+        match self.store.clear_auth() {
+            Ok(()) => {
+                self.username.clear();
+                self.status = Some((Tone::Info, "signed out — press S to sign in again".into()));
+            }
+            Err(error) => {
+                self.status = Some((Tone::Bad, format!("could not sign out: {error}").into()));
+            }
+        }
+
+        cx.notify();
+    }
+
     fn apply_sign_in(&mut self, message: SignIn, cx: &mut Context<Self>) {
         match message {
             SignIn::Code {
@@ -344,26 +371,20 @@ impl Browser {
                 // Open the page for them; GitHub still requires the code typed in
                 // by hand, so it stays on screen until authorization lands.
                 cx.open_url(&verification_uri);
-                self.sign_in = Some(DevicePrompt {
+                self.sign_in = Some(SignInPhase::AwaitingCode(DevicePrompt {
                     user_code,
                     verification_uri,
-                });
-                self.status = Some((Tone::Info, "waiting for authorization…".into()));
+                }));
             }
             SignIn::Authorized { username } => {
                 self.username = username;
-                self.sign_in = None;
-                self.status = Some((Tone::Good, "authorized — fetching your stars…".into()));
+                self.sign_in = Some(SignInPhase::Syncing {
+                    fetched: 0,
+                    page: 0,
+                });
             }
             SignIn::Syncing { fetched, page } => {
-                self.status = Some((
-                    Tone::Info,
-                    format!(
-                        "fetched {} stars (page {page})…",
-                        group_digits(fetched as u64)
-                    )
-                    .into(),
-                ));
+                self.sign_in = Some(SignInPhase::Syncing { fetched, page });
             }
             SignIn::Done { stars } => {
                 let count = stars.len();
@@ -574,6 +595,7 @@ impl Browser {
                         self.mode = Mode::Help;
                         cx.notify();
                     }
+                    "l" if shift => self.sign_out(cx),
                     "u" if shift => {
                         self.marked.clear();
                         self.status = Some((Tone::Info, "cleared marks".into()));
@@ -630,11 +652,12 @@ fn dim_text(text: impl Into<SharedString>) -> impl IntoElement {
 }
 
 impl Browser {
-    fn header(&self) -> impl IntoElement {
-        let account = if self.username.is_empty() {
-            "not signed in".to_string()
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let syncing = matches!(self.sign_in, Some(SignInPhase::Syncing { .. }));
+        let synced = if syncing {
+            "syncing…".to_string()
         } else {
-            self.username.clone()
+            format!("synced {}", relative_time(&self.last_synced_at, self.now))
         };
 
         div()
@@ -662,12 +685,32 @@ impl Browser {
                             .child(TAGLINE),
                     )
                     .child(div().text_color(rgb(FAINT)).child("│"))
-                    .child(div().text_color(rgb(GREEN)).child(account)),
+                    .children(if self.username.is_empty() {
+                        // Signed out, so this is the way back in — and the empty
+                        // state's button is hidden once stars are cached.
+                        Some(
+                            div()
+                                .id("header-sign-in")
+                                .text_color(rgb(CYAN))
+                                .cursor_pointer()
+                                .hover(|label| label.text_color(rgb(TEXT)))
+                                .on_click(
+                                    cx.listener(|this, _event, _window, cx| this.start_sign_in(cx)),
+                                )
+                                .child("sign in"),
+                        )
+                    } else {
+                        None
+                    })
+                    .children(
+                        (!self.username.is_empty())
+                            .then(|| div().text_color(rgb(GREEN)).child(self.username.clone())),
+                    ),
             )
             .child(div().text_color(rgb(DIM)).text_size(px(12.)).child(format!(
-                "{} stars · synced {} · {} shown",
+                "{} stars · {} · {} shown",
                 group_digits(self.all.len() as u64),
-                relative_time(&self.last_synced_at, self.now),
+                synced,
                 group_digits(self.rows.len() as u64),
             )))
     }
@@ -903,6 +946,83 @@ impl Browser {
     }
 
     fn sign_in_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.sign_in.as_ref() {
+            Some(SignInPhase::AwaitingCode(prompt)) => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .child(dim_text("1. open this page — it should already be open"))
+                .child(
+                    div()
+                        .text_color(rgb(CYAN))
+                        .child(prompt.verification_uri.clone()),
+                )
+                .child(div().pt(px(8.)).child(dim_text("2. enter this code")))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(16.))
+                        .child(
+                            div()
+                                .text_size(px(34.))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(YELLOW))
+                                .child(prompt.user_code.clone()),
+                        )
+                        .child(self.copy_button(cx)),
+                )
+                .child(
+                    div()
+                        .pt(px(10.))
+                        .child(dim_text("c to copy · esc to cancel")),
+                )
+                .into_any_element(),
+
+            // Authorized. The star fetch is the slowest part of a first run, so
+            // it gets the middle of the window rather than a line of footer text.
+            Some(SignInPhase::Syncing { fetched, page }) => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .text_color(rgb(GREEN))
+                        .child(format!("✔ signed in as {}", self.username)),
+                )
+                .child(
+                    div()
+                        .text_size(px(30.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(TEXT))
+                        .child(if *fetched == 0 {
+                            "fetching your stars…".to_string()
+                        } else {
+                            format!("{} stars", group_digits(*fetched as u64))
+                        }),
+                )
+                .children((*page > 0).then(|| dim_text(format!("page {page}"))))
+                .child(div().pt(px(6.)).child(dim_text("this only happens once")))
+                .into_any_element(),
+
+            _ => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .child(dim_text("contacting GitHub…"))
+                .child(div().pt(px(6.)).child(dim_text("esc to cancel")))
+                .into_any_element(),
+        };
+
+        let heading = if matches!(self.sign_in, Some(SignInPhase::Syncing { .. })) {
+            "Welcome to gittles"
+        } else {
+            "Sign in with GitHub"
+        };
+
         div()
             .flex_1()
             .flex()
@@ -914,41 +1034,9 @@ impl Browser {
                 div()
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgb(TEXT))
-                    .child("Sign in with GitHub"),
+                    .child(heading),
             )
-            .children(self.sign_in.as_ref().map(|prompt| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(dim_text("1. open this page — it should already be open"))
-                    .child(
-                        div()
-                            .text_color(rgb(CYAN))
-                            .child(prompt.verification_uri.clone()),
-                    )
-                    .child(div().pt(px(8.)).child(dim_text("2. enter this code")))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(16.))
-                            .child(
-                                div()
-                                    .text_size(px(34.))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(YELLOW))
-                                    .child(prompt.user_code.clone()),
-                            )
-                            .child(self.copy_button(cx)),
-                    )
-            }))
-            .child(
-                div()
-                    .pt(px(10.))
-                    .child(dim_text("c to copy · esc to cancel")),
-            )
+            .child(body)
     }
 
     fn copy_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -987,6 +1075,7 @@ impl Browser {
             ("c", "commit — unstar everything marked"),
             ("?", "this help"),
             ("S", "sign in and sync your stars"),
+            ("L", "sign out"),
             ("q", "quit"),
         ];
 
@@ -1038,10 +1127,10 @@ impl Render for Browser {
             // Capture, not bubble: the search field binds escape itself, and the
             // list keys must not reach it while it has focus.
             .capture_key_down(cx.listener(Self::on_key))
-            .child(self.header())
+            .child(self.header(cx))
             .child(self.search_row())
             .child(body)
-            .child(self.detail())
+            .children(matches!(self.mode, Mode::List | Mode::Search).then(|| self.detail()))
             .child(self.footer())
     }
 }
