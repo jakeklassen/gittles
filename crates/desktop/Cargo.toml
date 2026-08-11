@@ -12,5 +12,8 @@ path = "src/main.rs"
 gittles-core.workspace = true
 
 anyhow.workspace = true
+clap.workspace = true
 gpui.workspace = true
+gpui-component.workspace = true
+jiff.workspace = true
 tokio.workspace = true

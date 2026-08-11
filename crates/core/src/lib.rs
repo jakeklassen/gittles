@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod github;
+pub mod search;
 pub mod store;
 
 pub use auth::{DeviceCode, Poll};

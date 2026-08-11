@@ -40,7 +40,14 @@ impl Store {
     }
 
     /// The real store, under the platform config directory.
+    ///
+    /// `GITTLES_CONFIG_DIR` overrides it, which keeps development and
+    /// screenshot runs out of the directory holding your actual token.
     pub fn discover() -> Result<Self> {
+        if let Some(dir) = std::env::var_os("GITTLES_CONFIG_DIR") {
+            return Ok(Store::new(dir));
+        }
+
         let dirs = ProjectDirs::from("", "", APP_DIR)
             .ok_or_else(|| anyhow::anyhow!("could not locate a config directory"))?;
         Ok(Store::new(dirs.config_dir()))
