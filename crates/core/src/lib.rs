@@ -5,3 +5,7 @@
 pub mod auth;
 pub mod github;
 pub mod store;
+
+pub use auth::{DeviceCode, Poll};
+pub use github::{GitHub, Star};
+pub use store::{Config, Store};
