@@ -90,8 +90,8 @@ fn main() -> Result<()> {
     let store = Store::discover()?;
 
     if args.logout {
-        store.clear_auth()?;
-        println!("signed out");
+        store.sign_out()?;
+        println!("signed out — local star cache cleared");
         return Ok(());
     }
 

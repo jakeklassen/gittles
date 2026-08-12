@@ -346,13 +346,30 @@ impl Browser {
         .detach();
     }
 
-    /// Forget the token. The cached stars stay: they are expensive to refetch and
-    /// are not secret. A full reset means deleting the config directory.
+    /// Forget the token and the cached stars together. Leaving the list on
+    /// screen after signing out is both a lie and a dead end — the rows can
+    /// still be marked, but nothing can be committed without a token.
     fn sign_out(&mut self, cx: &mut Context<Self>) {
-        match self.store.clear_auth() {
+        match self.store.sign_out() {
             Ok(()) => {
+                let cleared = self.all.len();
+
                 self.username.clear();
-                self.status = Some((Tone::Info, "signed out — press S to sign in again".into()));
+                self.last_synced_at.clear();
+                self.all.clear();
+                self.rows.clear();
+                self.marked.clear();
+                self.selected = 0;
+                self.now = Timestamp::now();
+
+                self.status = Some((
+                    Tone::Info,
+                    format!(
+                        "signed out · {} stars cleared",
+                        group_digits(cleared as u64)
+                    )
+                    .into(),
+                ));
             }
             Err(error) => {
                 self.status = Some((Tone::Bad, format!("could not sign out: {error}").into()));
@@ -420,7 +437,7 @@ impl Browser {
 
         let token = self.store.load_config().token;
         if token.is_empty() {
-            self.status = Some((Tone::Bad, "sign in first: gittles --sync".into()));
+            self.status = Some((Tone::Bad, "sign in first — press S".into()));
             cx.notify();
             return;
         }
@@ -1075,7 +1092,7 @@ impl Browser {
             ("c", "commit — unstar everything marked"),
             ("?", "this help"),
             ("S", "sign in and sync your stars"),
-            ("L", "sign out"),
+            ("L", "sign out — also clears the local copy"),
             ("q", "quit"),
         ];
 

@@ -77,15 +77,21 @@ impl Store {
         Ok(())
     }
 
-    /// Forget the token but keep everything else — a logout should not also
-    /// throw away the sync bookkeeping.
-    pub fn clear_auth(&self) -> Result<()> {
-        let config = self.load_config();
-        self.save_config(&Config {
-            token: String::new(),
-            username: String::new(),
-            ..config
-        })
+    /// Sign out: forget the token *and* the cached stars.
+    ///
+    /// The CLI kept its cache across a logout, on the grounds that stars are
+    /// expensive to refetch. In a window that reads as a bug — your repos are
+    /// still listed after you have signed out, and they survive a restart.
+    /// "Signed out" has to mean the local copy is gone too.
+    pub fn sign_out(&self) -> Result<()> {
+        self.save_config(&Config::default())?;
+
+        match fs::remove_file(self.stars_path()) {
+            Ok(()) => Ok(()),
+            // Nothing cached is the desired end state, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -228,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_auth_keeps_the_sync_bookkeeping() {
+    fn sign_out_leaves_nothing_behind() {
         let (_tmp, store) = store();
         store
             .save_config(&Config {
@@ -237,14 +243,24 @@ mod tests {
                 last_synced_at: "2024-05-01T12:00:00Z".into(),
             })
             .unwrap();
+        store.save_stars(&[sample_star()]).unwrap();
 
-        store.clear_auth().unwrap();
+        store.sign_out().unwrap();
 
-        let config = store.load_config();
-        assert_eq!(config.token, "");
-        assert_eq!(config.username, "");
-        assert_eq!(config.last_synced_at, "2024-05-01T12:00:00Z");
+        assert_eq!(store.load_config(), Config::default());
         assert!(!store.is_authenticated());
+        // The cache goes with the token — a signed-out window must not still
+        // list your repos, on this run or the next one.
+        assert!(store.load_stars().is_empty());
+        assert!(!store.stars_path().exists());
+    }
+
+    #[test]
+    fn signing_out_twice_is_not_an_error() {
+        let (_tmp, store) = store();
+        store.sign_out().unwrap();
+        store.sign_out().unwrap();
+        assert!(store.load_stars().is_empty());
     }
 
     #[test]
